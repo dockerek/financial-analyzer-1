@@ -1,0 +1,216 @@
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
+
+class BaseScraper {
+    constructor(bankName, urls) {
+        this.bankName = bankName;
+        this.urls = urls;
+        this.maxRetries = 3;
+        this.retryDelay = 5000;
+    }
+
+    async scrape() {
+        console.log(`[${new Date().toISOString()}] 🔄 Bắt đầu scrape ${this.bankName}...`);
+        
+        for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+            try {
+                const result = await this._scrapeOnce();
+                if (result && result.length > 0) {
+                    console.log(`[${new Date().toISOString()}] ✅ ${this.bankName}: ${result.length} gói vay`);
+                    return result;
+                }
+            } catch (error) {
+                console.error(`[${new Date().toISOString()}] ❌ ${this.bankName} lần ${attempt} thất bại:`, error.message);
+                if (attempt < this.maxRetries) {
+                    await this.wait(this.retryDelay);
+                }
+            }
+        }
+        
+        console.log(`[${new Date().toISOString()}] ⚠️ ${this.bankName}: Dùng fallback data`);
+        return this.getFallbackData();
+    }
+
+    async _scrapeOnce() {
+        const browser = await puppeteer.launch({
+            headless: 'new',
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+        });
+        
+        try {
+            for (const url of this.urls) {
+                const page = await browser.newPage();
+                await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+                await page.setViewport({ width: 1280, height: 720 });
+                await page.setExtraHTTPHeaders({ 'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7' });
+                
+                console.log(`   → Truy cập: ${url}`);
+                const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+                await this.wait(10000);
+                const currentUrl = page.url();
+                const pageTitle = await page.title();
+
+                if (!response || response.status() >= 400 || /error-404|404/i.test(currentUrl) || /error|không tìm thấy trang|not found/i.test(pageTitle)) {
+                    console.warn(`   ⚠️ Bỏ qua trang không hợp lệ: ${currentUrl} (${response ? response.status() : 'no-response'})`);
+                    await page.close();
+                    continue;
+                }
+
+                const loans = await this.smartExtract(page);
+                if (loans && loans.length > 0) {
+                    await page.close();
+                    return loans;
+                }
+                await page.close();
+            }
+            return [];
+        } finally {
+            await browser.close();
+        }
+    }
+
+    // ==================== SELECTOR THÔNG MINH ====================
+    async smartExtract(page) {
+        return await page.evaluate(() => {
+            const parseRate = (text) => {
+                if (!text) return null;
+                const normalized = text.replace(/\./g, '').replace(/,/g, '.');
+                const match = normalized.match(/(\d+\.?\d*)\s*%/);
+                if (match) return parseFloat(match[1]);
+                return null;
+            };
+            
+            const cleanText = (text) => {
+                return text.replace(/\s+/g, ' ').trim().substring(0, 100);
+            };
+            
+            const extractTerm = (text) => {
+                if (!text) return 12;
+                const normalized = text.toLowerCase();
+                const yearMatch = normalized.match(/(\d+)\s*năm/);
+                if (yearMatch) return parseInt(yearMatch[1]) * 12;
+                const monthMatch = normalized.match(/(\d+)\s*tháng/);
+                if (monthMatch) return parseInt(monthMatch[1]);
+                return 12;
+            };
+
+            const results = [];
+
+            const addResult = (packageName, interestRate, context) => {
+                const cleanedName = cleanText(packageName || 'Gói vay ưu đãi');
+                if (!cleanedName || !interestRate || interestRate <= 0 || interestRate >= 50) return;
+                results.push({
+                    packageName: cleanedName,
+                    interestRate,
+                    maxTerm: extractTerm(context || cleanedName),
+                    minLoan: 50000000,
+                    maxLoan: 30000000000,
+                    pros: `Gói vay ${cleanedName} với lãi suất ${interestRate}%/năm`,
+                    cons: 'Liên hệ ngân hàng để biết chi tiết',
+                    requirements: 'Có phương án kinh doanh khả thi'
+                });
+            };
+
+            const foundKeys = new Set();
+
+            const allTables = document.querySelectorAll('table');
+            for (const table of allTables) {
+                const tableText = table.innerText.toLowerCase();
+                if (tableText.includes('lãi suất') || tableText.includes('interest rate') || tableText.includes('%/năm') || tableText.includes('% / năm')) {
+                    const rows = table.querySelectorAll('tr');
+                    for (const row of rows) {
+                        const cells = row.querySelectorAll('td, th');
+                        if (cells.length >= 2) {
+                            const title = cells[0]?.innerText?.trim() || '';
+                            const rateText = cells[1]?.innerText || '';
+                            const rate = parseRate(rateText);
+                            if (rate && rate > 0 && rate < 50) {
+                                const key = `${cleanText(title)}|${rate}`;
+                                if (!foundKeys.has(key)) {
+                                    foundKeys.add(key);
+                                    addResult(title, rate, tableText + ' ' + title);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (results.length === 0) {
+                const candidates = Array.from(document.querySelectorAll('body *'))
+                    .filter(el => el.childElementCount === 0 && el.innerText && el.innerText.includes('%'))
+                    .slice(0, 200);
+
+                for (const el of candidates) {
+                    const text = el.innerText;
+                    const rate = parseRate(text);
+                    if (rate && rate > 0 && rate < 50) {
+                        let name = '';
+                        const parent = el.closest('section, article, div, table, header, footer, main');
+                        if (parent) {
+                            name = parent.innerText.replace(text, '').split('\n').find(line => line.trim().length > 0) || '';
+                        }
+                        if (!name) {
+                            name = el.previousElementSibling?.innerText || el.parentElement?.innerText || text;
+                        }
+                        const key = `${cleanText(name)}|${rate}`;
+                        if (!foundKeys.has(key)) {
+                            foundKeys.add(key);
+                            addResult(name, rate, parent?.innerText || text);
+                        }
+                    }
+                }
+            }
+
+            if (results.length === 0) {
+                const bodyText = document.body.innerText || '';
+                const lines = bodyText.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    const rate = parseRate(line);
+                    if (rate && rate > 0 && rate < 50) {
+                        const name = lines[i - 1] || lines[i + 1] || 'Gói vay sản xuất kinh doanh';
+                        const key = `${cleanText(name)}|${rate}`;
+                        if (!foundKeys.has(key)) {
+                            foundKeys.add(key);
+                            addResult(name, rate, name + ' ' + line);
+                        }
+                    }
+                }
+            }
+
+            return results;
+        });
+    }
+    
+    static parseRate(text) {
+        if (!text) return null;
+        const normalized = text.replace(/\./g, '').replace(/,/g, '.');
+        const match = normalized.match(/(\d+\.?\d*)\s*%/);
+        if (match) return parseFloat(match[1]);
+        return null;
+    }
+    
+    static cleanText(text) {
+        return text.replace(/\s+/g, ' ').trim().substring(0, 100);
+    }
+    
+    static extractTerm(text) {
+        const yearMatch = text.match(/(\d+)\s*năm/);
+        if (yearMatch) return parseInt(yearMatch[1]) * 12;
+        const monthMatch = text.match(/(\d+)\s*tháng/);
+        if (monthMatch) return parseInt(monthMatch[1]);
+        return 12;
+    }
+
+    async wait(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    getFallbackData() {
+        return [];
+    }
+}
+
+module.exports = BaseScraper;
