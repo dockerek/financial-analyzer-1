@@ -1,0 +1,12 @@
+{
+  "name": "financial-analyzer-pro",
+  "version": "2.0.0",
+  "scripts": {
+    "build": "cd backend && npm install",
+    "start": "cd backend && node server.js",
+    "scrape": "cd backend && node runOnce.js"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
